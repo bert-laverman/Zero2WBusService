@@ -1,0 +1,8 @@
+# CMake build artifacts
+build/
+build-*/
+cmake/
+.cache/
+
+# VSCode files
+.vscode/
