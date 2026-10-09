@@ -22,11 +22,13 @@
 #include <vector>
 
 #include <filesystem>
+#include <functional>
 #include <fstream>
 
 #include "address-store.hpp"
 #include "bus-core.hpp"
 #include "commands.hpp"
+#include "log.hpp"
 #include "config.hpp"
 #include "ini-file.hpp"
 
@@ -245,6 +247,8 @@ static void testCommands()
     CHECK(run("brightness vs 4").second == "  ok\n");
     CHECK(core.state("vs")->brightness == 4);
     CHECK(run("bogus").second.find("unknown command") != std::string::npos);
+    CHECK(run("\xC2\xA0set heading 5").second == "  ok\n");        // a non-breaking space from a copied command
+    CHECK(run("se\xC2\xA7t x 1").second == "  unknown command 'se\\xc2\\xa7t'; try 'help'\n");    // and an odd character is shown
     CHECK(run("").first);
     CHECK(!run("quit").first);
 
@@ -361,6 +365,41 @@ static void testBrightnessBeforeNumber()
     CHECK((std::ranges::find(sink.log, "bright pico-1/1 9") < std::ranges::find(sink.log, "show pico-1/1 7")));
 }
 
+static std::string logged(const Log& log, const std::function<void(const Log&)>& what)
+{
+    std::ostringstream captured;
+    auto* old = std::cerr.rdbuf(captured.rdbuf());
+    what(log);
+    std::cerr.rdbuf(old);
+    return captured.str();
+}
+
+static void testLog()
+{
+    CHECK(Log::parse("debug") == Log::Level::Debug);
+    CHECK(!Log::parse("verbose").has_value());
+
+    // The bus controller has no levels; its lines are sorted by their first character. The default level (info) is quiet
+    // about the Hello of every board, every few seconds, and says what happened.
+    Log log;
+    auto fromController = [](const std::string& line) { return [line](const Log& l) { l.controller(line); }; };
+    CHECK(logged(log, fromController("Received Hello message from 0x61, board with Id e6614104-031a8938\n")).empty());
+    CHECK(logged(log, fromController("- Board announced itself on address 0x61.\n")).find("INFO  - Board announced") != std::string::npos);
+    CHECK(logged(log, fromController("* No free address left.\n")).find("WARN  * No free address left.") != std::string::npos);
+
+    log.level(Log::Level::Debug);
+    CHECK(logged(log, fromController("Received Hello message from 0x61, board with Id x\n")).find("DEBUG Received Hello") != std::string::npos);
+
+    // One line per message, however many newlines it came with; a time in front, 'HH:MM:SS '.
+    const auto line = logged(log, [](const Log& l) { l.info("{} board(s)", 2); });
+    CHECK(line.size() > 9 && line[2] == ':' && line[5] == ':' && line[8] == ' ');
+    CHECK(line.substr(9) == "INFO  2 board(s)\n");
+
+    log.level(Log::Level::Error);
+    CHECK(logged(log, [](const Log& l) { l.warning("nobody hears this"); }).empty());
+    CHECK(logged(log, [](const Log& l) { l.error("this is heard"); }).find("ERROR this is heard") != std::string::npos);
+}
+
 static void testEvents()
 {
     RecordingSink sink;
@@ -392,6 +431,7 @@ int main()
     testValidationAndRetry();
     testBrightnessBeforeNumber();
     testEvents();
+    testLog();
 
     if (failures != 0) {
         std::cerr << failures << " check(s) failed.\n";

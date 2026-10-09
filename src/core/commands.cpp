@@ -17,6 +17,7 @@
 #include "commands.hpp"
 
 #include <charconv>
+#include <format>
 #include <sstream>
 #include <string>
 
@@ -30,6 +31,35 @@ bool toInt(const std::string& text, int32_t& value)
     const auto end = text.data() + text.size();
     const auto [ptr, ec] = std::from_chars(text.data(), end, value);
     return (ec == std::errc{}) && (ptr == end);
+}
+
+/** A non-breaking space (UTF-8 C2 A0) is what you get when you copy a command from a web page; treat it as the space it looks like. */
+std::string withPlainSpaces(std::string_view line)
+{
+    std::string plain;
+    for (size_t i = 0; i < line.size(); i++) {
+        if ((line[i] == '\xC2') && (i + 1 < line.size()) && (line[i + 1] == '\xA0')) {
+            plain += ' ';
+            i++;
+        } else {
+            plain += line[i];
+        }
+    }
+    return plain;
+}
+
+/** For a message: the text, with anything that is not plain ASCII as \xNN, so that an invisible character shows. */
+std::string visible(std::string_view text)
+{
+    std::string shown;
+    for (unsigned char c : text) {
+        if ((c >= 0x20) && (c < 0x7f)) {
+            shown += static_cast<char>(c);
+        } else {
+            shown += std::format("\\x{:02x}", c);
+        }
+    }
+    return shown;
 }
 
 void help(std::ostream& out)
@@ -68,7 +98,7 @@ void show(BusCore& core, std::ostream& out)
 
 bool runCommand(BusCore& core, std::string_view line, std::ostream& out)
 {
-    std::istringstream words{ std::string(line) };
+    std::istringstream words{ withPlainSpaces(line) };
     std::string command, arg1, arg2;
     words >> command >> arg1 >> arg2;
 
@@ -112,7 +142,7 @@ bool runCommand(BusCore& core, std::string_view line, std::ostream& out)
             out << "  " << ((event.type == Event::Type::BoardOnline) ? "online " : "offline ") << event.board << "\n";
         }
     } else {
-        out << "  unknown command '" << command << "'; try 'help'\n";
+        out << "  unknown command '" << visible(command) << "'; try 'help'\n";
     }
     return true;
 }

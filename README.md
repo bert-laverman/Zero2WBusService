@@ -1,7 +1,7 @@
 # Zero2WBusService
 
 A service that keeps running on a Raspberry Pi Zero 2 W, owns the I2C bus to the Picos, and lets other programs ask it to pass
-things on to them. Status: **the core (step 1) is tested on a PC; the adapter to the bus (step 1b) builds for the Zero, but has not run on real hardware yet.**
+things on to them. Status: **the core (step 1) is tested on a PC; the adapter to the bus (step 1b) has run on berry-1 with two Picos (9 October 2026, see below).**
 
 It uses [CppRaspberry](https://github.com/bert-laverman/CppRaspberry). Read `docs/i2c-bus.md` there first: it describes the bus,
 the address assignment, what has been tested, and the environment.
@@ -100,6 +100,11 @@ messages. It does not use `RemoteMAX7219`, which keeps its own copy of the displ
 a board that restarted. The bus controller's `onBoardAppeared()` and `onBoardGone()` become `boardOnline()` and `boardOffline()`.
 A message the bus refuses is tried again after half a second. The service stops on SIGINT and SIGTERM, with `driver.close()`.
 
+The log has a time and a level on every line, on standard error (`--log-level error|warning|info|debug`, or `I2CBUS_LOG`;
+default `info`). The bus controller has no levels of its own, so its lines are sorted by their first character: `* ...` is a
+warning, `- ...` is info, and the rest, the "Received Hello" of every board every few seconds, is debug. The answers to commands
+go to standard output: run with `2>>i2cbus.log` to keep them apart. A line that is pasted without its newline waits for Enter.
+
 Only one bus controller can run at a time: `Zero2WTestI2C` and this service both want the BSC slave at address `0x0a`.
 
 ### Trying it on berry-1
@@ -115,6 +120,24 @@ Type commands on its input: `show`, `set altitude 12345`, `set altitude blank`, 
 from the Pi 5 (`picotool reboot -f --bus B --address A`, with the numbers from `cppr-deploy --list-picos`): after about 13 seconds
 the service logs that the board is gone and appeared again, and its display should show the last value without anything being
 typed. Stop with Ctrl-C and check that the bus still works (the next start finds the boards again).
+
+### What was tested on berry-1 (9 October 2026)
+
+Two Picos (`PicoTestI2C`, a MAX7219 each, 0x61 and 0x62), commands typed on the service's input, restarts from the Pi 5:
+
+| Test | Result |
+|---|---|
+| Start with both boards already running | Both `appeared` within 2 seconds, no restart needed |
+| `set`, `blank`, `brightness` on both displays | Displays follow; a number out of range is refused (`value out of range`) |
+| Board A restarted (`picotool reboot -f`) | `gone` after 10 s, `appeared` and address saved at 11 to 13 s; the display showed its last value again without a command |
+| Board B in BOOTSEL, a value set while it was gone, then started | `gone` 10 s after BOOTSEL; the value set while offline showed after `appeared` |
+| Ctrl-C, then start again at once (twice) | `Shutting down.`; both boards found again within 2 seconds |
+
+Not tested yet: stopping with Ctrl-C or `kill` in the middle of a burst of messages, a failing bus (the retry delay), many
+updates at once on the real bus, and a service restart with displays that show something (see below).
+
+The service forgets what the displays showed when it stops: only the addresses are saved. After a restart a board keeps showing
+what it showed, until somebody sets it.
 
 ## Building for the Zero
 

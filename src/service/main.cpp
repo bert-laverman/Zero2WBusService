@@ -17,19 +17,24 @@
 // The service: it owns the I2C bus, keeps the displays of the boards up to date, and (until there is an HTTP layer) takes the
 // commands of `commands.hpp` on its standard input.
 //
-//   i2cbus [config [state]]
+//   i2cbus [--log-level error|warning|info|debug] [config [state]]
 //
-// The configuration is `i2cbus.ini`, and the state file is where the addresses of the boards are kept.
+// The configuration is `i2cbus.ini`, and the state file is where the addresses of the boards are kept. The log (with a time and
+// a level on every line) goes to standard error, the answers to commands to standard output: `2>>i2cbus.log` keeps them apart.
+// The level can also be set with the environment variable I2CBUS_LOG. The default is info; debug shows every Hello of every board.
 
 #include <csignal>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <format>
 #include <iostream>
+#include <string_view>
 #include <map>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <poll.h>
 #include <unistd.h>
@@ -46,6 +51,7 @@
 #include "bus-core.hpp"
 #include "bus-sink.hpp"
 #include "commands.hpp"
+#include "log.hpp"
 
 using namespace nl::rakis::i2cbus;
 namespace pi = nl::rakis::raspberrypi;
@@ -78,7 +84,7 @@ void onSignal(int) { stopRequested = 1; }
  * The addresses we know of: those in the state file, and for a board of the configuration that is not in there, the address the
  * configuration wishes for. Two boards that want the same address are a mistake we do not pass on to the bus.
  */
-std::map<std::string, uint8_t> knownAddresses(const Config& config, const AddressStore& store)
+std::map<std::string, uint8_t> knownAddresses(const Config& config, const AddressStore& store, const Log& log)
 {
     std::map<std::string, uint8_t> known = store.all();
     for (const auto& board : config.boards()) {
@@ -91,10 +97,10 @@ std::map<std::string, uint8_t> knownAddresses(const Config& config, const Addres
     std::map<uint8_t, std::string> owner;
     for (const auto& [boardId, address] : known) {
         if ((address < firstBoardAddress) || (address > lastBoardAddress)) {
-            std::cerr << std::format("Ignoring address 0x{:02x} of board {}: not from 0x{:02x} to 0x{:02x}.\n", address, boardId,
-                                     firstBoardAddress, lastBoardAddress);
+            log.warning("Ignoring address 0x{:02x} of board {}: not from 0x{:02x} to 0x{:02x}.", address, boardId,
+                        firstBoardAddress, lastBoardAddress);
         } else if (auto other = owner.find(address); other != owner.end()) {
-            std::cerr << std::format("Ignoring address 0x{:02x} of board {}: board {} has it.\n", address, boardId, other->second);
+            log.warning("Ignoring address 0x{:02x} of board {}: board {} has it.", address, boardId, other->second);
         } else {
             owner[address] = boardId;
             usable[boardId] = address;
@@ -147,16 +153,47 @@ int main(int argc, char* argv[])
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
-    const std::string configFile{ (argc >= 2) ? argv[1] : "/etc/i2cbus/i2cbus.ini" };
-    const std::string stateFile{ (argc >= 3) ? argv[2] : "/var/lib/i2cbus/i2cbus-state.ini" };
+    Log log;
+    std::vector<std::string> files;
+    auto chooseLevel = [&log](std::string_view text) {
+        const auto level = Log::parse(text);
+        if (level) {
+            log.level(*level);
+        }
+        return level.has_value();
+    };
+    if (const char* fromEnvironment = std::getenv("I2CBUS_LOG"); (fromEnvironment != nullptr) && !chooseLevel(fromEnvironment)) {
+        std::cerr << "I2CBUS_LOG must be error, warning, info or debug, not '" << fromEnvironment << "'.\n";
+        return 2;
+    }
+    for (int i = 1; i < argc; i++) {
+        const std::string_view arg{ argv[i] };
+        if (arg == "--log-level") {
+            if ((i + 1 >= argc) || !chooseLevel(argv[++i])) {
+                std::cerr << "--log-level must be followed by error, warning, info or debug.\n";
+                return 2;
+            }
+        } else if (arg.starts_with("--")) {
+            std::cerr << "Unknown option '" << arg << "'. Usage: i2cbus [--log-level LEVEL] [config [state]]\n";
+            return 2;
+        } else {
+            files.emplace_back(arg);
+        }
+    }
+    if (files.size() > 2) {
+        std::cerr << "Usage: i2cbus [--log-level LEVEL] [config [state]]\n";
+        return 2;
+    }
+    const std::string configFile{ (files.size() >= 1) ? files[0] : "/etc/i2cbus/i2cbus.ini" };
+    const std::string stateFile{ (files.size() >= 2) ? files[1] : "/var/lib/i2cbus/i2cbus-state.ini" };
 
     try {
         auto config = Config::load(configFile);
         for (const auto& warning : config.warnings()) {
-            std::cerr << "Warning: " << warning << "\n";
+            log.warning("{}", warning);
         }
         auto store = AddressStore::load(stateFile);
-        const auto addresses = knownAddresses(config, store);
+        const auto addresses = knownAddresses(config, store, log);
 
         auto pi2picoBus = std::make_shared<pi::interfaces::I2CDevI2C>("/dev/i2c-1");
         auto pico2piBus = std::make_shared<pi::interfaces::PigpiodBSCI2C>();
@@ -170,33 +207,35 @@ int main(int argc, char* argv[])
 
         // The bus controller hands out the addresses; we keep them, so a board has the same one after a restart.
         pi::protocols::I2CBusController controller(driver);
+        controller.logger([&log](const std::string& line) { log.controller(line); });
         controller.addressRange(firstBoardAddress, lastBoardAddress);
         for (const auto& [boardId, address] : addresses) {
             controller.addKnown(parseBoardId(boardId), address);
         }
-        controller.onConfirmed([&store](const pi::protocols::BoardId& id, uint8_t address) {
-            if (!store.set(boardIdString(id), address)) {
-                std::cerr << std::format("Cannot save the address 0x{:02x} of board {}: it will not survive a restart.\n",
-                                         address, boardIdString(id));
+        controller.onConfirmed([&store, &log](const pi::protocols::BoardId& id, uint8_t address) {
+            if (store.set(boardIdString(id), address)) {
+                log.info("Saved address 0x{:02x} of board {}.", address, boardIdString(id));
+            } else {
+                log.error("Cannot save the address 0x{:02x} of board {}: it will not survive a restart.", address, boardIdString(id));
             }
         });
 
         // A board that appears has lost whatever it showed (also one that restarted before we noticed it was gone): the core
         // sends everything again. A board that is not in the configuration is not ours to show anything on.
-        controller.onBoardAppeared([&core, &sink](const pi::protocols::BoardId& id, uint8_t address) {
+        controller.onBoardAppeared([&core, &sink, &log](const pi::protocols::BoardId& id, uint8_t address) {
             const auto boardId = boardIdString(id);
             const auto* board = core.config().boardById(boardId);
             if (board == nullptr) {
-                std::cerr << std::format("Board {} on address 0x{:02x} appeared, but is not in the configuration.\n", boardId, address);
+                log.warning("Board {} on address 0x{:02x} appeared, but is not in the configuration.", boardId, address);
                 return;
             }
-            std::cerr << std::format("Board '{}' ({}) appeared on address 0x{:02x}.\n", board->name, boardId, address);
+            log.info("Board '{}' ({}) appeared on address 0x{:02x}.", board->name, boardId, address);
             sink.attach(board->name, address);
             core.boardOnline(board->name);
         });
-        controller.onBoardGone([&core, &sink](const pi::protocols::BoardId& id, uint8_t address) {
+        controller.onBoardGone([&core, &sink, &log](const pi::protocols::BoardId& id, uint8_t address) {
             if (auto name = sink.detach(address)) {
-                std::cerr << std::format("Board '{}' ({}) on address 0x{:02x} is gone.\n", *name, boardIdString(id), address);
+                log.info("Board '{}' ({}) on address 0x{:02x} is gone.", *name, boardIdString(id), address);
                 core.boardOffline(*name);
             }
         });
@@ -204,8 +243,9 @@ int main(int argc, char* argv[])
 
         driver.listenAddress(controllerAddress);
         driver.startListening();
-        std::cerr << std::format("{} board(s) and {} display(s) in {}, {} address(es) known. Listening.\n",
-                                 core.config().boards().size(), core.config().displays().size(), configFile, addresses.size());
+        log.info("{} board(s) and {} display(s) in {}, {} address(es) known. Listening (log level {}).",
+                 core.config().boards().size(), core.config().displays().size(), configFile, addresses.size(),
+                 log.levelName());
 
         StdinLines input;
         std::string line;
@@ -215,6 +255,7 @@ int main(int argc, char* argv[])
             driver.processIncoming();
 
             while (input.next(line)) {
+                log.debug("Command: {}", line);
                 if (!runCommand(core, line, std::cout)) {
                     stopRequested = 1;
                 }
@@ -223,11 +264,11 @@ int main(int argc, char* argv[])
             core.flush();
         }
 
-        std::cerr << "Shutting down.\n";
+        log.info("Shutting down.");
         driver.stopListening();
         driver.close();
     } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << "\n";
+        log.error("{}", e.what());
         return 1;
     }
     return 0;
