@@ -17,9 +17,10 @@
 // The service: it owns the I2C bus, keeps the displays of the boards up to date, and (until there is an HTTP layer) takes the
 // commands of `commands.hpp` on its standard input.
 //
-//   i2cbus [--log-level error|warning|info|debug] [config [state]]
+//   i2cbus [--log-level error|warning|info|debug] [--socket PATH] [config [state]]
 //
-// The configuration is `i2cbus.ini`, and the state file is where the addresses of the boards are kept. The log (with a time and
+// With --socket the API of api.hpp is served over HTTP on a Unix socket (mode 0660: whoever may open it may use it). Without,
+// only the commands on standard input work. The configuration is `i2cbus.ini`, and the state file is where the addresses of the boards are kept. The log (with a time and
 // a level on every line) goes to standard error, the answers to commands to standard output: `2>>i2cbus.log` keeps them apart.
 // The level can also be set with the environment variable I2CBUS_LOG. The default is info; debug shows every Hello of every board.
 
@@ -32,12 +33,10 @@
 #include <string_view>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <poll.h>
-#include <unistd.h>
 
 #include <zero2w.hpp>
 #include <interfaces/pigpiod-i2c.hpp>
@@ -49,9 +48,13 @@
 #include "board-id.hpp"
 #include "bus-core.hpp"
 #include "bus-sink.hpp"
+#include "api.hpp"
 #include "commands.hpp"
+#include "event-log.hpp"
+#include "http-server.hpp"
 #include "log.hpp"
 #include "state-store.hpp"
+#include "stdin-lines.hpp"
 
 using namespace nl::rakis::i2cbus;
 namespace pi = nl::rakis::raspberrypi;
@@ -114,41 +117,6 @@ std::map<std::string, uint8_t> knownAddresses(const Config& config, const StateS
 }
 
 
-/**
- * Lines from the standard input, without ever waiting for one: the bus has to be served every 10 ms. When the input is closed
- * (as it is for a service that systemd starts) it stays quiet.
- */
-class StdinLines {
-    std::string pending_;
-    bool open_{ true };
-
-public:
-    /** The next complete line, if there is one. */
-    bool next(std::string& line) {
-        for (;;) {
-            if (auto eol = pending_.find('\n'); eol != std::string::npos) {
-                line = pending_.substr(0, eol);
-                pending_.erase(0, eol + 1);
-                return true;
-            }
-            if (!open_) {
-                return false;
-            }
-            pollfd fd{ STDIN_FILENO, POLLIN, 0 };
-            if ((poll(&fd, 1, 0) <= 0) || !(fd.revents & (POLLIN | POLLHUP))) {
-                return false;
-            }
-            char buffer[256];
-            const auto n = read(STDIN_FILENO, buffer, sizeof(buffer));
-            if (n <= 0) {
-                open_ = false;
-                return false;
-            }
-            pending_.append(buffer, static_cast<size_t>(n));
-        }
-    }
-};
-
 } // namespace
 
 
@@ -158,6 +126,7 @@ int main(int argc, char* argv[])
     std::signal(SIGTERM, onSignal);
 
     Log log;
+    std::string socketPath;
     std::vector<std::string> files;
     auto chooseLevel = [&log](std::string_view text) {
         const auto level = Log::parse(text);
@@ -177,15 +146,21 @@ int main(int argc, char* argv[])
                 std::cerr << "--log-level must be followed by error, warning, info or debug.\n";
                 return 2;
             }
+        } else if (arg == "--socket") {
+            if (i + 1 >= argc) {
+                std::cerr << "--socket must be followed by the path of the socket.\n";
+                return 2;
+            }
+            socketPath = argv[++i];
         } else if (arg.starts_with("--")) {
-            std::cerr << "Unknown option '" << arg << "'. Usage: i2cbus [--log-level LEVEL] [config [state]]\n";
+            std::cerr << "Unknown option '" << arg << "'. Usage: i2cbus [--log-level LEVEL] [--socket PATH] [config [state]]\n";
             return 2;
         } else {
             files.emplace_back(arg);
         }
     }
     if (files.size() > 2) {
-        std::cerr << "Usage: i2cbus [--log-level LEVEL] [config [state]]\n";
+        std::cerr << "Usage: i2cbus [--log-level LEVEL] [--socket PATH] [config [state]]\n";
         return 2;
     }
     const std::string configFile{ (files.size() >= 1) ? files[0] : "/etc/i2cbus/i2cbus.ini" };
@@ -225,6 +200,12 @@ int main(int argc, char* argv[])
             lastSave = std::chrono::steady_clock::now();
         };
 
+        // The core is used by this loop and by the threads of the HTTP server, one at a time: whoever has this mutex has the core.
+        std::mutex mutex;
+        EventLog events;
+        Api api(core, mutex, events);
+        HttpServer http(api, events, log);
+
         // The bus controller hands out the addresses; we keep them, so a board has the same one after a restart.
         pi::protocols::I2CBusController controller(driver);
         controller.logger([&log](const std::string& line) { log.controller(line); });
@@ -261,6 +242,14 @@ int main(int argc, char* argv[])
         });
         controller.registerHandlers();
 
+        // The socket first: if that does not work we stop here, and have not touched the bus.
+        if (!socketPath.empty()) {
+            if (const auto problem = http.start(socketPath); !problem.empty()) {
+                log.error("{}", problem);
+                return 1;
+            }
+        }
+
         driver.listenAddress(controllerAddress);
         driver.startListening();
         log.info("{} board(s) and {} display(s) in {}, {} address(es) known. Listening (log level {}).",
@@ -270,9 +259,14 @@ int main(int argc, char* argv[])
         StdinLines input;
         std::string line;
         while (!stopRequested) {
-            controller.tick();                              // says Hello once per second, repeats addresses, notices boards gone
+            {
+                std::lock_guard lock(mutex);
+                controller.tick();                          // says Hello once per second, repeats addresses, notices boards gone
+            }
             std::this_thread::sleep_for(tickInterval);
-            driver.processIncoming();
+
+            std::lock_guard lock(mutex);
+            driver.processIncoming();                       // also calls what the controller reports: boards appear and go
 
             while (input.next(line)) {
                 log.debug("Command: {}", line);
@@ -282,6 +276,7 @@ int main(int argc, char* argv[])
                 std::cout.flush();
             }
             core.flush();
+            drainEvents(core, events);
 
             if ((core.revision() != saved) && (std::chrono::steady_clock::now() - lastSave >= saveInterval)) {
                 saveDisplays();
@@ -289,6 +284,7 @@ int main(int argc, char* argv[])
         }
 
         log.info("Shutting down.");
+        http.stop();                                        // nobody calls into the core from here on
         if (core.revision() != saved) {
             saveDisplays();
         }

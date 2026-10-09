@@ -1,7 +1,7 @@
 # Zero2WBusService
 
 A service that keeps running on a Raspberry Pi Zero 2 W, owns the I2C bus to the Picos, and lets other programs ask it to pass
-things on to them. Status: **the core (step 1) is tested on a PC; the adapter to the bus (step 1b) has run on berry-1 with two Picos (9 October 2026, see below).**
+things on to them. Status: **the core (step 1) and the adapter to the bus (step 1b) have run on berry-1 with two Picos (9 October 2026); the HTTP layer (step 2) has run on berry-1 as well (see below).**
 
 It uses [CppRaspberry](https://github.com/bert-laverman/CppRaspberry). Read `docs/i2c-bus.md` there first: it describes the bus,
 the address assignment, what has been tested, and the environment.
@@ -68,7 +68,7 @@ state file that the service writes itself (the addresses), `/run/i2cbus.sock`, `
 
 1. **The core, without network:** the configuration with names, the state per display, sending it again when a board appears,
    merging updates. Tested with a small command line program. **Done**, see below.
-2. **The HTTP layer over the Unix socket** on that core.
+2. **The HTTP layer over the Unix socket** on that core. **Built**, see below.
 3. **The systemd service**, and a short guide.
 4. Then a TCP listener with a token, for the Windows PC.
 
@@ -91,7 +91,7 @@ interface, `Sink`; the adapter that implements it with `RemoteMAX7219` and `I2CB
 * What a display shows is a `variant` (`Blank`, `Number`), so segments and text can be added.
 
 ```bash
-cmake -S . -B build && cmake --build build && build/tools/core-test    # the tests
+cmake -S . -B build && cmake --build build && build/tools/core-test && build/tools/http-test    # the tests
 build/tools/i2cbus-cli ../Zero2WTestI2C/i2c-state.ini                   # try it by hand, type 'help'
 ```
 
@@ -139,11 +139,76 @@ Two Picos (`PicoTestI2C`, a MAX7219 each, 0x61 and 0x62), commands typed on the 
 | `set` and Ctrl-C within 10 s | The value is in the state file: stopping saves it |
 | Service stopped, board A restarted, service started | Display A showed its last value again (777), display B too (-250), without a command |
 
+The HTTP API, with `curl --unix-socket` on berry-1 (same day, `i2cbus --socket ~/i2cbus.sock`):
+
+| Test | Result |
+|---|---|
+| The socket | Mode `srw-rw----` |
+| `GET /displays`, `/boards`, `/displays/<name>` | The values restored from the state file, with `online` true for both boards |
+| `PUT /displays/altitude` with a value and a brightness | 200, the display as it is then |
+| A float, an unknown field, a number out of range, an unknown display, `POST` | 400, 400, 422, 404, 405 with `Allow` |
+| Board B restarted | Events `boardOffline` 7 to 10 s after the restart, `boardOnline` after 12 s, matching the log |
+| `GET /events?after=<next>&wait=30` while board A restarted | The call returned when `boardOffline` came (9 s after the restart), not after 30 s; `boardOnline` then followed with the new `next` |
+
+Not tested yet on berry-1: removing the socket when the service stops, replacing a socket that a killed program left behind,
+and stopping while a client waits for events (all three are tested on a PC, in `http-test`).
+
 Not tested yet: stopping with Ctrl-C or `kill` in the middle of a burst of messages, a failing bus (the retry delay), and
 many updates at once on the real bus.
 
 The values of the displays are saved and restored (see `StateStore`). A board that has never been given a value is left as it is, so after a restart it shows its own address: new boards are not
 blanked (decided on 9 October 2026).
+
+## The HTTP API (step 2)
+
+`i2cbus --socket PATH` serves the API over HTTP on a Unix socket. The socket is created with mode `0660`, so only its owner and
+group can connect: that is the whole access control, there are no passwords or certificates. (The default path of the installed
+service will be `/run/i2cbus.sock`, from its systemd unit; without `--socket` there is no socket.) A client is `curl`:
+
+```bash
+curl --unix-socket /run/i2cbus.sock http://localhost/displays
+curl --unix-socket /run/i2cbus.sock -X PUT -d '{"value": 35000, "brightness": 3}' http://localhost/displays/altitude
+```
+
+| Request | Meaning |
+|---|---|
+| `GET /displays`, `GET /displays/<name>` | what each display should show, its brightness, and whether its board is online |
+| `PUT /displays/<name>` with `{"value": 35000, "brightness": 3}` | show a number and/or set the brightness; at least one of the two |
+| `DELETE /displays/<name>` | blank the display |
+| `GET /boards` | the boards, and whether they are online |
+| `GET /events?after=<seq>&wait=<seconds>` | what happened to the boards after `seq`; waits up to `wait` seconds (at most 30) for the next one |
+
+An answer is JSON. A display looks like `{"name": "altitude", "board": "pico-a", "module": 0, "online": true, "content":
+{"type": "number", "value": 35000}, "brightness": 3}`; `content` is `null` as long as nobody has said what to show, and
+`{"type": "blank"}` for a blank display (other kinds of content can follow, so look at `type`). `PUT` and `DELETE` answer with the
+display as it is then. They change what the display *should* show: it goes to the board at once if it is online, and when it
+comes online if it is not (`online` says which), and many updates in a short time are merged into the last.
+
+A request is checked in full, and one that is refused changes nothing:
+
+| Status | When |
+|---|---|
+| 400 | the body is not JSON or not an object, a field is not known (`valeu`), `value` or `brightness` is not an integer (`35000.0` is not), or there is nothing to change |
+| 404 | no such display, or no such path |
+| 405 | the method does not fit the path (`Allow` says which do) |
+| 413 | the body is longer than 4096 bytes |
+| 422 | a number the display cannot show (-9999999 to 99999999) or a brightness outside 0 to 15 |
+| 503 | too many clients are waiting for events (two at most) |
+
+`GET /events` answers `{"events": [{"seq": 1791532948277, "time": "2026-10-09T08:02:29Z", "type": "boardOnline", "board":
+"pico-a"}], "next": 1791532948277}`. Keep `next` and give it as `after` the next time; that way you miss nothing and see nothing
+twice. The numbers only go up, also over a restart of the service (they start at the time of the start, in milliseconds), the last 256
+events are kept, and with `wait` the call returns at once when something happens. When the service stops, a waiting call returns.
+
+The server runs four threads and queues sixteen more connections, reads and writes with a timeout of 5 seconds, and takes
+no more than 4096 bytes of body. A socket that a killed program left behind is replaced; one that somebody listens on, or a file
+that is not a socket, is not touched and stops the start. A path that starts with `@` (a socket without a file, so without rights)
+is refused.
+
+How it is built: `Api` (`src/core/api.cpp`) turns an `ApiRequest` into an `ApiResponse` and knows nothing of sockets, so the
+routes are tested in `core-test`; `HttpServer` (`src/http`) is the thin layer around cpp-httplib, tested with real sockets in
+`http-test`. The libraries are in `third_party/` (see its README). To try the API on a PC, without a bus: `i2cbus-sim
+--socket /tmp/i2cbus.sock i2cbus.ini.example`, and type `online pico-a` to let a board appear.
 
 ## Building for the Zero
 
@@ -160,3 +225,10 @@ project are synchronised to the Pi 5.
   have is an error in the configuration. Measuring on real hardware comes later.
 * Segments and text: a new message type in CppRaspberry, later. The core is ready for it.
 * Leds and buttons: only board online/offline events for now. Buttons and leds when they have been tried on real hardware.
+
+## Licences
+
+This project is under the Apache License 2.0 (see `LICENSE`). `third_party/` holds two libraries under the MIT licence, copied
+unchanged with their copyright notices: [cpp-httplib](https://github.com/yhirose/cpp-httplib) (Yuji Hirose) and
+[nlohmann/json](https://github.com/nlohmann/json) (Niels Lohmann). Their licence texts are in `third_party/`, and
+`third_party/README.md` has the versions and checksums.

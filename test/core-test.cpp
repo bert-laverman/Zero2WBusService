@@ -24,11 +24,15 @@
 #include <algorithm>
 #include <filesystem>
 #include <functional>
+#include <thread>
 #include <fstream>
 
+#include "api.hpp"
 #include "bus-core.hpp"
 #include "commands.hpp"
+#include "event-log.hpp"
 #include "log.hpp"
+#include "json.hpp"
 #include "state-store.hpp"
 #include "config.hpp"
 #include "ini-file.hpp"
@@ -37,8 +41,10 @@ using namespace nl::rakis::i2cbus;
 
 
 static int failures{ 0 };
+static int checks{ 0 };
 
-#define CHECK(cond) do { if (!(cond)) { failures++; std::cerr << __FILE__ << ':' << __LINE__ << ": CHECK failed: " #cond "\n"; } } while (0)
+// Variadic, so that a comma in the condition (an initializer list, a template argument) is not taken for a second argument.
+#define CHECK(...) do { checks++; if (!(__VA_ARGS__)) { failures++; std::cerr << __FILE__ << ':' << __LINE__ << ": CHECK failed: " #__VA_ARGS__ "\n"; } } while (0)
 
 template <typename Error, typename F>
 static bool throws(F&& f, const std::string& contains)
@@ -506,6 +512,193 @@ static void testLog()
     CHECK(logged(log, [](const Log& l) { l.error("this is heard"); }).find("ERROR this is heard") != std::string::npos);
 }
 
+struct ApiFixture {
+    RecordingSink sink;
+    BusCore core{ configFrom(goodIni), sink };
+    std::mutex mutex;
+    EventLog events;
+    Api api{ core, mutex, events };
+
+    struct Answer {
+        int status;
+        nlohmann::json body;
+        std::string raw;
+        std::vector<std::pair<std::string, std::string>> headers;
+    };
+
+    Answer call(const std::string& method, const std::string& path, const std::string& body = "",
+                std::map<std::string, std::string> query = {}) {
+        const auto response = api.handle(ApiRequest{ method, path, std::move(query), body });
+        return Answer{ response.status, nlohmann::json::parse(response.body, nullptr, false), response.body, response.headers };
+    }
+};
+
+static void testApi()
+{
+    ApiFixture f;
+    using json = nlohmann::json;
+
+    // What is there.
+    auto list = f.call("GET", "/displays");
+    CHECK(list.status == 200);
+    CHECK(list.body["displays"].size() == 3);
+    CHECK(list.body["displays"][0]["name"] == "altitude");
+    CHECK(list.body["displays"][0]["content"].is_null());
+    CHECK(list.body["displays"][0]["brightness"] == 10);
+    CHECK(list.body["displays"][0]["online"] == false);
+    auto one = f.call("GET", "/displays/vs");
+    CHECK(one.status == 200 && one.body["board"] == "pico-1" && one.body["module"] == 1);
+    CHECK(f.call("GET", "/displays/nope").status == 404);
+    CHECK(f.call("GET", "/displays/Not Valid").status == 404);          // not even a name
+    CHECK(f.call("GET", "/displays/altitude/x").status == 404);
+    CHECK(f.call("GET", "/displays/").status == 404);
+    CHECK(f.call("GET", "/nothing").status == 404);
+    CHECK(f.call("GET", "/boards").body["boards"][0]["boardId"] == "e6614104-031c5032");
+
+    // Show a number, with a brightness, in one request.
+    auto put = f.call("PUT", "/displays/altitude", R"({"value": 35000, "brightness": 3})");
+    CHECK(put.status == 200);
+    CHECK((put.body["content"] == json{ { "type", "number" }, { "value", 35000 } }));
+    CHECK(put.body["brightness"] == 3);
+    CHECK(f.call("PUT", "/displays/altitude", R"({"brightness": 4})").body["content"]["value"] == 35000);   // only what is given
+    CHECK(f.call("PUT", "/displays/altitude", R"({"value": -250})").body["brightness"] == 4);
+    CHECK(f.core.state("altitude")->content == Content{ Number{ -250 } });
+    CHECK(f.call("DELETE", "/displays/altitude").body["content"] == json{ { "type", "blank" } });
+    CHECK(f.core.state("altitude")->content == Content{ Blank{} });
+
+    // Everything is checked, and a request that is refused changes nothing.
+    f.core.update("vs", number(7));
+    struct Bad { const char* body; int status; const char* message; };
+    const Bad bad[] = {
+        { "", 400, "not valid JSON" },
+        { "{", 400, "not valid JSON" },
+        { "[1]", 400, "must be a JSON object" },
+        { "35000", 400, "must be a JSON object" },
+        { "{}", 400, "nothing to change" },
+        { R"({"valeu": 1})", 400, "unknown field 'valeu'" },
+        { R"({"value": 1, "colour": "red"})", 400, "unknown field 'colour'" },
+        { R"({"value": "35000"})", 400, "'value' must be an integer" },
+        { R"({"value": 35000.0})", 400, "'value' must be an integer" },
+        { R"({"value": 3.5e4})", 400, "'value' must be an integer" },
+        { R"({"value": true})", 400, "'value' must be an integer" },
+        { R"({"value": null})", 400, "'value' must be an integer" },
+        { R"({"value": 100000000})", 422, "out of range" },
+        { R"({"value": -10000000})", 422, "out of range" },
+        { R"({"value": 18446744073709551615})", 422, "out of range" },
+        { R"({"value": 99999999999999999999999})", 400, "'value' must be an integer" },
+        { R"({"brightness": 16})", 422, "from 0 to 15" },
+        { R"({"brightness": -1})", 422, "from 0 to 15" },
+        { R"({"brightness": "bright"})", 400, "'brightness' must be an integer" },
+        { R"({"value": 5, "brightness": 99})", 422, "from 0 to 15" },
+    };
+    for (const auto& b : bad) {
+        const auto answer = f.call("PUT", "/displays/vs", b.body);
+        const bool ok = (answer.status == b.status) && answer.raw.find(b.message) != std::string::npos;
+        if (!ok) { std::cerr << "  for body '" << b.body << "': " << answer.status << " " << answer.raw << "\n"; }
+        CHECK(ok);
+    }
+    CHECK(f.core.state("vs")->content == Content{ Number{ 7 } });          // none of those changed anything
+    CHECK(f.core.state("vs")->brightness == 5);
+    CHECK(f.call("PUT", "/displays/vs", std::string(Api::maxBody + 1, ' ')).status == 413);
+    CHECK(f.call("PUT", "/displays/nope", R"({"value": 1})").status == 404);
+
+    // The right method.
+    auto notAllowed = f.call("POST", "/displays/vs", R"({"value": 1})");
+    CHECK(notAllowed.status == 405);
+    CHECK(!notAllowed.headers.empty() && notAllowed.headers[0] == std::pair<std::string, std::string>("Allow", "GET, PUT, DELETE"));
+    CHECK(f.call("PUT", "/displays", "{}").status == 405);
+    CHECK(f.call("DELETE", "/boards").status == 405);
+    CHECK(f.call("PUT", "/events").status == 405);
+
+    // Online shows.
+    f.core.boardOnline("pico-1");
+    CHECK(f.call("GET", "/displays/vs").body["online"] == true);
+    CHECK(f.call("GET", "/boards").body["boards"][0]["online"] == true);
+}
+
+static void testEventLog()
+{
+    using std::chrono::milliseconds;
+    EventLog log(3);
+
+    auto empty = log.since(0);
+    CHECK(empty && empty->entries.empty());
+    const auto start = empty->next;
+
+    log.append(Event{ Event::Type::BoardOnline, "a" });
+    log.append(Event{ Event::Type::BoardOffline, "a" });
+    auto all = log.since(0);
+    CHECK(all && all->entries.size() == 2);
+    CHECK(all && all->entries[0].seq == start + 1 && all->entries[1].seq == start + 2 && all->next == start + 2);
+    auto later = log.since(all->entries[0].seq);
+    CHECK(later && later->entries.size() == 1 && later->entries[0].board == "a" && later->entries[0].type == Event::Type::BoardOffline);
+    CHECK(log.since(all->next)->entries.empty());
+    CHECK(log.since(all->next)->next == all->next);
+
+    // Only the last few are kept, and the numbers go on.
+    for (int i = 0; i < 5; i++) { log.append(Event{ Event::Type::BoardOnline, "b" }); }
+    auto kept = log.since(0);
+    CHECK(kept && kept->entries.size() == 3 && kept->next == start + 7);
+
+    // A number from before a restart is lower than all of ours: the client gets everything and no number comes twice.
+    CHECK(log.since(1)->entries.size() == 3);
+    // A number from the future (a clock that went back) gets nothing, and the number it gave back.
+    CHECK(log.since(start + 1000)->entries.empty() && log.since(start + 1000)->next == start + 1000);
+
+    // Waiting: no wait gives an answer at once; a wait ends when something arrives.
+    const auto before = std::chrono::steady_clock::now();
+    CHECK(log.since(kept->next, milliseconds(0))->entries.empty());
+    CHECK(std::chrono::steady_clock::now() - before < milliseconds(200));
+
+    std::optional<EventLog::Batch> waited;
+    std::thread waiter([&] { waited = log.since(kept->next, std::chrono::seconds(10)); });
+    std::this_thread::sleep_for(milliseconds(100));
+    log.append(Event{ Event::Type::BoardOffline, "c" });
+    waiter.join();
+    CHECK(waited && waited->entries.size() == 1 && waited->entries[0].board == "c");
+    CHECK(std::chrono::steady_clock::now() - before < std::chrono::seconds(5));
+
+    // A wait that times out gives an empty answer.
+    CHECK(log.since(waited->next, milliseconds(50))->entries.empty());
+
+    // Too many waiting: the next one is refused, and shutdown lets them all go.
+    std::optional<EventLog::Batch> w1, w2;
+    std::thread t1([&] { w1 = log.since(waited->next, std::chrono::seconds(10)); });
+    std::thread t2([&] { w2 = log.since(waited->next, std::chrono::seconds(10)); });
+    std::this_thread::sleep_for(milliseconds(150));
+    CHECK(!log.since(waited->next, std::chrono::seconds(10)).has_value());
+    log.shutdown();
+    t1.join();
+    t2.join();
+    CHECK(w1 && w1->entries.empty() && w2 && w2->entries.empty());
+    CHECK(log.since(waited->next, std::chrono::seconds(10))->entries.empty());      // after shutdown nobody waits
+}
+
+static void testApiEvents()
+{
+    ApiFixture f;
+    f.events.append(Event{ Event::Type::BoardOnline, "pico-1" });
+    auto got = f.call("GET", "/events");
+    CHECK(got.status == 200 && got.body["events"].size() == 1);
+    CHECK(got.body["events"][0]["type"] == "boardOnline" && got.body["events"][0]["board"] == "pico-1");
+    const std::string time = got.body["events"][0]["time"];
+    CHECK(time.size() == 20 && time[4] == '-' && time[10] == 'T' && time.back() == 'Z');
+
+    const auto next = got.body["next"].get<uint64_t>();
+    CHECK(got.body["events"][0]["seq"].get<uint64_t>() == next);
+    CHECK(f.call("GET", "/events", "", { { "after", std::to_string(next) } }).body["events"].empty());
+
+    f.events.append(Event{ Event::Type::BoardOffline, "pico-1" });
+    auto more = f.call("GET", "/events", "", { { "after", std::to_string(next) }, { "wait", "5" } });
+    CHECK(more.status == 200 && more.body["events"].size() == 1 && more.body["events"][0]["type"] == "boardOffline");
+
+    CHECK(f.call("GET", "/events", "", { { "after", "abc" } }).status == 400);
+    CHECK(f.call("GET", "/events", "", { { "after", "" } }).status == 400);
+    CHECK(f.call("GET", "/events", "", { { "after", "-1" } }).status == 400);
+    CHECK(f.call("GET", "/events", "", { { "wait", "31" } }).status == 400);
+    CHECK(f.call("GET", "/events", "", { { "wait", "x" } }).status == 400);
+}
+
 static void testEvents()
 {
     RecordingSink sink;
@@ -539,12 +732,15 @@ int main()
     testValidationAndRetry();
     testBrightnessBeforeNumber();
     testEvents();
+    testApi();
+    testApiEvents();
+    testEventLog();
     testLog();
 
     if (failures != 0) {
         std::cerr << failures << " check(s) failed.\n";
         return 1;
     }
-    std::cout << "All checks passed.\n";
+    std::cout << "All " << checks << " checks passed.\n";
     return 0;
 }

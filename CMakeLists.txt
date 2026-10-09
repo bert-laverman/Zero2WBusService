@@ -63,20 +63,31 @@ add_library(i2cbus-core STATIC
     src/core/config.cpp
     src/core/state-store.cpp
     src/core/commands.cpp
+    src/core/api.cpp
     src/core/bus-core.cpp)
 target_include_directories(i2cbus-core PUBLIC src/core)
+# The libraries in third_party are not ours to fix: their warnings do not stop our build (-Werror).
+target_include_directories(i2cbus-core SYSTEM PUBLIC third_party)
 target_compile_options(i2cbus-core PRIVATE -Wall -Wextra -Werror)
+
+# The HTTP side: a thin layer on a Unix socket in front of the Api. Standard library and the libraries in third_party only.
+add_library(i2cbus-http STATIC src/http/http-server.cpp)
+target_include_directories(i2cbus-http PUBLIC src/http)
+target_link_libraries(i2cbus-http PUBLIC i2cbus-core)
+target_link_options(i2cbus-http PUBLIC -pthread)
+target_compile_options(i2cbus-http PRIVATE -Wall -Wextra -Werror)
 
 if(I2CBUS_ZERO)
   # GCC notes that the way std::format_args is passed changed in GCC 9.1, for every std::format call. Nobody mixes old and
   # new objects here.
   target_compile_options(i2cbus-core PRIVATE -Wno-psabi)
+  target_compile_options(i2cbus-http PRIVATE -Wno-psabi)
 
   include(${CPP_RASPBERRY_PATH}/CppRaspberry.cmake)
 
   add_executable(${APP_NAME} src/service/main.cpp)
   add_cpp_raspberry_app(${APP_NAME})
-  target_link_libraries(${APP_NAME} i2cbus-core pigpiod_if2)
+  target_link_libraries(${APP_NAME} i2cbus-http pigpiod_if2)
   target_compile_options(${APP_NAME} PRIVATE -Wall -Wextra -Werror -Wno-psabi)
   target_link_options(${APP_NAME} PRIVATE -static -pthread)
 else()
@@ -87,10 +98,21 @@ else()
   target_compile_options(i2cbus-cli PRIVATE -Wall -Wextra -Werror)
   set_target_properties(i2cbus-cli PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${TOOLS_DIR})
 
+  add_executable(i2cbus-sim src/cli/i2cbus-sim.cpp)
+  target_link_libraries(i2cbus-sim i2cbus-http)
+  target_compile_options(i2cbus-sim PRIVATE -Wall -Wextra -Werror)
+  set_target_properties(i2cbus-sim PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${TOOLS_DIR})
+
   enable_testing()
   add_executable(core-test test/core-test.cpp)
   target_link_libraries(core-test i2cbus-core)
   target_compile_options(core-test PRIVATE -Wall -Wextra -Werror)
   set_target_properties(core-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${TOOLS_DIR})
   add_test(NAME core-test COMMAND core-test)
+
+  add_executable(http-test test/http-test.cpp)
+  target_link_libraries(http-test i2cbus-http)
+  target_compile_options(http-test PRIVATE -Wall -Wextra -Werror)
+  set_target_properties(http-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${TOOLS_DIR})
+  add_test(NAME http-test COMMAND http-test)
 endif()
