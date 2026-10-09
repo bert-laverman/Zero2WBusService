@@ -1,7 +1,7 @@
 # Zero2WBusService
 
 A service that keeps running on a Raspberry Pi Zero 2 W, owns the I2C bus to the Picos, and lets other programs ask it to pass
-things on to them. Status: **an idea, nothing is built yet.** This file is the starting point.
+things on to them. Status: **the core (step 1) is tested on a PC; the adapter to the bus (step 1b) builds for the Zero, but has not run on real hardware yet.**
 
 It uses [CppRaspberry](https://github.com/bert-laverman/CppRaspberry). Read `docs/i2c-bus.md` there first: it describes the bus,
 the address assignment, what has been tested, and the environment.
@@ -28,7 +28,7 @@ stays up, and that other programs (scripts, a bridge to a flight simulator, ...)
 
 First clients: scripts and small programs on the command line, on the Zero itself.
 
-1. **HTTP with JSON, over a Unix socket** (`/run/busd.sock`). A client is `curl --unix-socket /run/busd.sock ...`. Only those
+1. **HTTP with JSON, over a Unix socket** (`/run/i2cbus.sock`). A client is `curl --unix-socket /run/i2cbus.sock ...`. Only those
    in a group that owns the socket can reach it; no passwords or certificates. A header-only HTTP library
    ([cpp-httplib](https://github.com/yhirose/cpp-httplib)) and `nlohmann-json` do the work, which is light enough for a Zero.
    (Unix sockets are, as far as I know, supported by cpp-httplib: check.)
@@ -59,17 +59,75 @@ range), and the service runs as its own user, without privileges, with the syste
 On the Zero that owns the bus (here: `berry-1`). A Raspberry Pi 5 is used to cross-compile and flash (see `cppr-deploy` in
 CppRaspberry); it has no part in the service.
 
+## Names
+
+The service is called `i2cbus`: `/etc/i2cbus/i2cbus.ini` (what the displays are called and where they sit, edited by hand), a
+state file that the service writes itself (the addresses), `/run/i2cbus.sock`, `i2cbus.service`, and a user and group `i2cbus`.
+
 ## Plan
 
 1. **The core, without network:** the configuration with names, the state per display, sending it again when a board appears,
-   merging updates. Tested with a small command line program.
+   merging updates. Tested with a small command line program. **Done**, see below.
 2. **The HTTP layer over the Unix socket** on that core.
 3. **The systemd service**, and a short guide.
 4. Then a TCP listener with a token, for the Windows PC.
 
-## Open points
+## The core (step 1)
 
-* The format of the configuration: use the existing INI, or something else?
-* Several displays (modules) per board: the base supports it, but it has not been measured.
-* Segments (`setBuffer`) and text need a new message type, in CppRaspberry.
-* Leds and buttons (`Led`, `Button` messages exist, but have not been tried).
+The core (`src/core`) only needs the standard library, so it builds and is tested on any machine. The bus is behind one
+interface, `Sink`; the adapter that implements it with `RemoteMAX7219` and `I2CBusController` is not written yet.
+
+* `IniFile`, `Config`: reads `i2cbus.ini`, which has the shape of the old `i2c-state.ini` (display, device, interface and board
+  sections). Mistakes (a double name, a module that does not exist, an unknown board) are errors that say where; keys that are
+  not used give a warning.
+* `BusCore`: the state per display, **merging** (only the last value per display goes out at a `flush()`), **sending again**
+  when a board comes online, and a queue of events (board online/offline).
+* `AddressStore`: the addresses of the boards, in a file that only the service writes (the configuration is never rewritten).
+* `runCommand`: the text commands (`set altitude 35000`, `show`, ...) of the command line tool, which the service also takes on
+  its standard input until there is an HTTP layer.
+* What a display shows is a `variant` (`Blank`, `Number`), so segments and text can be added.
+
+```bash
+cmake -S . -B build && cmake --build build && build/tools/core-test    # the tests
+build/tools/i2cbus-cli ../Zero2WTestI2C/i2c-state.ini                   # try it by hand, type 'help'
+```
+
+## The adapter (step 1b)
+
+`src/service` is the part that only builds for the Zero: `main.cpp` runs the loop (every 10 ms: the bus controller's `tick()`,
+`processIncoming()`, the commands on stdin, and `BusCore::flush()`), and `BusSink` sends what the core wants as `Max7219`
+messages. It does not use `RemoteMAX7219`, which keeps its own copy of the display state and so would not send a value again to
+a board that restarted. The bus controller's `onBoardAppeared()` and `onBoardGone()` become `boardOnline()` and `boardOffline()`.
+A message the bus refuses is tried again after half a second. The service stops on SIGINT and SIGTERM, with `driver.close()`.
+
+Only one bus controller can run at a time: `Zero2WTestI2C` and this service both want the BSC slave at address `0x0a`.
+
+### Trying it on berry-1
+
+`cppr-deploy Zero2WBusService` puts `~/i2cbus` on the Zero. Copy `i2cbus.ini.example` to `~/i2cbus.ini` there, put the real
+board ids in (from `~/i2c-state.ini`), and make sure `test-i2c` is not running.
+
+```bash
+./i2cbus ~/i2cbus.ini ~/i2cbus-state.ini
+```
+
+Type commands on its input: `show`, `set altitude 12345`, `set altitude blank`, `brightness altitude 8`. Then restart a Pico
+from the Pi 5 (`picotool reboot -f --bus B --address A`, with the numbers from `cppr-deploy --list-picos`): after about 13 seconds
+the service logs that the board is gone and appeared again, and its display should show the last value without anything being
+typed. Stop with Ctrl-C and check that the bus still works (the next start finds the boards again).
+
+## Building for the Zero
+
+`cppr-deploy Zero2WBusService` (see `tools/README.md` in CppRaspberry) builds on the Pi 5 with the toolchain file, and copies
+the first executable it finds in `build/` to the Zero. So `CMakeLists.txt` has two modes (`I2CBUS_ZERO`, on when there is a
+toolchain file): for the Zero it builds only the service `i2cbus`; on a PC it builds the core, the command line tool and the
+tests, in `build/tools/`. Anything we need besides the library has to live in this directory: only the library and this
+project are synchronised to the Pi 5.
+
+## Decisions
+
+* Configuration: the INI format, split in `i2cbus.ini` (by hand) and a state file (by the service).
+* Several modules per board: `index` per display, the configuration decides how many. An `index` that the interface does not
+  have is an error in the configuration. Measuring on real hardware comes later.
+* Segments and text: a new message type in CppRaspberry, later. The core is ready for it.
+* Leds and buttons: only board online/offline events for now. Buttons and leds when they have been tried on real hardware.

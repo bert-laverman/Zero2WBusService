@@ -1,0 +1,41 @@
+# Example configuration for i2cbus. Copy it, and put the real board ids in (on berry-1 they are in ~/i2c-state.ini).
+#
+# A display (what clients call it) sits on a device, a device on an interface, an interface is controlled by a board.
+# The addresses of the boards are not here: the service keeps them in its state file. An 'address' in a board section is
+# only used for a board that the state file does not know yet (0x61 is 97, 0x62 is 98).
+
+[board:pico-a]
+boardid = 00000000-00000000
+address = 97
+
+[board:pico-b]
+boardid = 00000000-00000001
+address = 98
+
+[interface:spi-a]
+controller = pico-a
+modules = 1
+
+[interface:spi-b]
+controller = pico-b
+modules = 1
+
+[device:max-a]
+interface = spi-a
+type = max7219
+
+[device:max-b]
+interface = spi-b
+type = max7219
+
+[display:1]
+name = altitude
+device = max-a
+index = 0
+brightness = 3
+
+[display:2]
+name = heading
+device = max-b
+index = 0
+brightness = 3
