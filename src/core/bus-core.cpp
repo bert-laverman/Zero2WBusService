@@ -96,10 +96,12 @@ Status BusCore::update(std::string_view display, const Update& change)
     if (change.content && (entry->state.content != change.content)) {
         entry->state.content = change.content;
         entry->contentDirty = true;
+        revision_++;
     }
     if (change.brightness && (entry->state.brightness != change.brightness)) {
         entry->state.brightness = change.brightness;
         entry->brightnessDirty = true;
+        revision_++;
     }
     return Status::Ok;
 }

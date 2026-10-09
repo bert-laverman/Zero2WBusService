@@ -21,14 +21,15 @@
 #include <string>
 #include <vector>
 
+#include <algorithm>
 #include <filesystem>
 #include <functional>
 #include <fstream>
 
-#include "address-store.hpp"
 #include "bus-core.hpp"
 #include "commands.hpp"
 #include "log.hpp"
+#include "state-store.hpp"
 #include "config.hpp"
 #include "ini-file.hpp"
 
@@ -191,41 +192,146 @@ static void testBoardAddress()
     CHECK(throws<ConfigError>([&] { configFrom(replaced(goodIni, "address=97", "address=200")); }, "0 to 119"));
 }
 
-static void testAddressStore()
+static void testStateStoreAddresses()
 {
     const auto dir = std::filesystem::temp_directory_path() / "i2cbus-core-test";
     std::filesystem::create_directories(dir);
     const auto path = (dir / "state.ini").string();
     std::filesystem::remove(path);
 
-    auto store = AddressStore::load(path);                      // not there yet: empty
-    CHECK(store.all().empty());
+    auto store = StateStore::load(path);                      // not there yet: empty
+    CHECK(store.addresses().empty());
     CHECK(!store.address("e6614104-031c5032").has_value());
-    CHECK(store.set("e6614104-031c5032", 97));
-    CHECK(store.set("0a0b0c0d-01020304", 98));
+    CHECK(store.setAddress("e6614104-031c5032", 97));
+    CHECK(store.setAddress("0a0b0c0d-01020304", 98));
 
-    auto again = AddressStore::load(path);                      // and back from the file
-    CHECK(again.all().size() == 2);
+    auto again = StateStore::load(path);                      // and back from the file
+    CHECK(again.addresses().size() == 2);
     CHECK(again.address("e6614104-031c5032") == 97);
     CHECK(again.address("0a0b0c0d-01020304") == 98);
     CHECK(!std::filesystem::exists(path + ".tmp"));             // renamed, not left behind
 
     {   // A file that makes no sense is an error, not an empty store: that would hand out the addresses again.
         std::ofstream(path) << "[board:not-an-id]\naddress = 1\n";
-        CHECK(throws<IniError>([&] { AddressStore::load(path); }, "not a board id"));
+        CHECK(throws<IniError>([&] { StateStore::load(path); }, "not a board id"));
         std::ofstream(path) << "[board:e6614104-031c5032]\naddress = 300\n";
-        CHECK(throws<IniError>([&] { AddressStore::load(path); }, "needs an 'address'"));
+        CHECK(throws<IniError>([&] { StateStore::load(path); }, "needs an 'address'"));
         std::ofstream(path) << "[board:e6614104-031c5032]\n";
-        CHECK(throws<IniError>([&] { AddressStore::load(path); }, "needs an 'address'"));
+        CHECK(throws<IniError>([&] { StateStore::load(path); }, "needs an 'address'"));
     }
     std::filesystem::remove_all(dir);
 
-    AddressStore memory;                                        // no file: for tests that do not need one
-    CHECK(memory.set("e6614104-031c5032", 97));
+    StateStore memory;                                        // no file: for tests that do not need one
+    CHECK(memory.setAddress("e6614104-031c5032", 97));
     CHECK(memory.address("e6614104-031c5032") == 97);
 
-    AddressStore unwritable = AddressStore::load("/nonexistent-dir/state.ini");
-    CHECK(!unwritable.set("e6614104-031c5032", 97));            // the caller hears that it was not saved
+    StateStore unwritable = StateStore::load("/nonexistent-dir/state.ini");
+    CHECK(!unwritable.setAddress("e6614104-031c5032", 97));            // the caller hears that it was not saved
+}
+
+static std::string fileText(const std::string& path)
+{
+    std::ifstream in(path);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+static void testStateStoreDisplays()
+{
+    const auto dir = std::filesystem::temp_directory_path() / "i2cbus-core-test-displays";
+    std::filesystem::create_directories(dir);
+    const auto path = (dir / "state.ini").string();
+    std::filesystem::remove(path);
+
+    auto store = StateStore::load(path);
+    store.setAddress("e6614104-031c5032", 97);
+    store.setDisplay("altitude", DisplayState{ Content{ Number{ -250 } }, std::nullopt });
+    store.setDisplay("vs", DisplayState{ Content{ Blank{} }, uint8_t{ 9 } });
+    store.setDisplay("heading", DisplayState{ std::nullopt, uint8_t{ 2 } });
+    CHECK(store.dirty());                                       // the displays are noted, not written yet
+    CHECK(fileText(path).find("display:") == std::string::npos);
+    CHECK(store.save());
+    CHECK(!store.dirty());
+
+    auto again = StateStore::load(path);
+    CHECK(again.addresses().size() == 1);
+    CHECK(again.displays().size() == 3);
+    CHECK(again.displays().at("altitude").content == Content{ Number{ -250 } });
+    CHECK(!again.displays().at("altitude").brightness.has_value());
+    CHECK(again.displays().at("vs").content == Content{ Blank{} });
+    CHECK(again.displays().at("vs").brightness == 9);
+    CHECK(!again.displays().at("heading").content.has_value());          // brightness alone is worth keeping
+
+    // Nothing changed: nothing to write. A display with nothing left to remember goes out of the file.
+    store.setDisplay("altitude", DisplayState{ Content{ Number{ -250 } }, std::nullopt });
+    CHECK(!store.dirty());
+    store.setDisplay("heading", DisplayState{});
+    CHECK(store.dirty());
+    CHECK(store.save());
+    CHECK(StateStore::load(path).displays().size() == 2);
+
+    // This file is ours, so what we do not understand is an error and not something to skip.
+    auto bad = [&](const std::string& text, const std::string& message) {
+        std::ofstream(path) << text;
+        return throws<IniError>([&] { StateStore::load(path); }, message);
+    };
+    CHECK(bad("[display:altitude]\ncontent = lots\n", "must be a number or 'blank'"));
+    CHECK(bad("[display:altitude]\ncontent = 99999999999\n", "must be a number or 'blank'"));
+    CHECK(bad("[display:altitude]\nbrightness = 16\n", "0 to 15"));
+    CHECK(bad("[display:altitude]\ncolour = red\n", "which we do not know"));
+    CHECK(bad("[display:Not Valid]\ncontent = 1\n", "not a display name"));
+    CHECK(bad("[something]\nx = 1\n", "not a [board:...] or [display:...]"));
+    std::filesystem::remove_all(dir);
+}
+
+static void testRestoreAndSnapshot()
+{
+    RecordingSink sink;
+    BusCore core(configFrom(goodIni), sink);
+    CHECK(core.revision() == 0);
+
+    // Saved by an earlier run: a number, a brightness of a client, a display that is gone, and a number that no longer fits.
+    StateStore store;
+    store.setDisplay("altitude", DisplayState{ Content{ Number{ 35000 } }, uint8_t{ 8 } });
+    store.setDisplay("vs", DisplayState{ Content{ Blank{} }, std::nullopt });
+    store.setDisplay("removed", DisplayState{ Content{ Number{ 1 } }, std::nullopt });
+    store.setDisplay("heading", DisplayState{ Content{ Number{ 100'000'000 } }, std::nullopt });
+    const auto failed = restoreDisplays(core, store);
+    CHECK(failed.size() == 2);
+    using Failure = std::pair<std::string, Status>;
+    CHECK(failed.size() == 2 && failed[0] == Failure("heading", Status::OutOfRange));
+    CHECK(failed.size() == 2 && failed[1] == Failure("removed", Status::UnknownDisplay));
+    CHECK(core.state("altitude")->content == Content{ Number{ 35000 } });
+    CHECK(core.state("altitude")->brightness == 8);                      // the client's choice beats the configuration's
+    CHECK(core.state("vs")->brightness == 5);                            // nothing saved: the configuration's
+    CHECK(!core.state("heading")->content.has_value());
+    CHECK(core.revision() > 0);
+
+    // Nothing goes out before the board is there, and everything does when it is. 'heading' and 'vs' were never given a
+    // number (or were blanked): the board is not blanked behind our back.
+    core.flush();
+    CHECK(sink.log.empty());
+    core.boardOnline("pico-1");
+    core.flush();
+    CHECK((std::ranges::find(sink.log, "show pico-1/0 35000") != sink.log.end()));
+    CHECK((std::ranges::find(sink.log, "bright pico-1/0 8") != sink.log.end()));
+    CHECK((std::ranges::find(sink.log, "show pico-1/1 blank") != sink.log.end()));
+    CHECK(std::none_of(sink.log.begin(), sink.log.end(), [](const std::string& l) { return l.starts_with("show pico-1/2"); }));
+
+    // And back: a brightness that is the configured one is not kept, one that differs is. A revision only moves on a change.
+    StateStore after;
+    snapshotDisplays(core, after);
+    CHECK(after.displays().at("altitude").content == Content{ Number{ 35000 } });
+    CHECK(after.displays().at("altitude").brightness == 8);
+    CHECK(after.displays().at("vs").content == Content{ Blank{} });
+    CHECK(!after.displays().at("vs").brightness.has_value());
+    CHECK(after.displays().count("heading") == 0);                       // nothing to remember
+
+    const auto revision = core.revision();
+    core.update("altitude", number(35000));                              // the same again
+    core.update("nope", number(1));                                      // refused
+    CHECK(core.revision() == revision);
+    core.update("altitude", number(35001));
+    CHECK(core.revision() == revision + 1);
 }
 
 static void testCommands()
@@ -425,7 +531,9 @@ int main()
     testIni();
     testConfig();
     testBoardAddress();
-    testAddressStore();
+    testStateStoreAddresses();
+    testStateStoreDisplays();
+    testRestoreAndSnapshot();
     testCommands();
     testMergingAndResend();
     testValidationAndRetry();

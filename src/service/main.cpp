@@ -46,12 +46,12 @@
 #include <protocols/i2c-bus-controller.hpp>
 #include <util/message-queue.hpp>
 
-#include "address-store.hpp"
 #include "board-id.hpp"
 #include "bus-core.hpp"
 #include "bus-sink.hpp"
 #include "commands.hpp"
 #include "log.hpp"
+#include "state-store.hpp"
 
 using namespace nl::rakis::i2cbus;
 namespace pi = nl::rakis::raspberrypi;
@@ -71,6 +71,10 @@ constexpr uint8_t firstBoardAddress{ 0x61 };    // the first address we hand out
 constexpr uint8_t lastBoardAddress{ 0x77 };
 constexpr auto tickInterval = std::chrono::milliseconds(10);
 
+// What the displays show is saved at most this often (and when we stop): a simulator changes it many times a second, and every
+// save is a write to the SD card.
+constexpr auto saveInterval = std::chrono::seconds(10);
+
 
 /**
  * Stop on Ctrl-C or a kill: leave the loop, so that the BSC slave is switched off on the way out. A program that is simply
@@ -84,9 +88,9 @@ void onSignal(int) { stopRequested = 1; }
  * The addresses we know of: those in the state file, and for a board of the configuration that is not in there, the address the
  * configuration wishes for. Two boards that want the same address are a mistake we do not pass on to the bus.
  */
-std::map<std::string, uint8_t> knownAddresses(const Config& config, const AddressStore& store, const Log& log)
+std::map<std::string, uint8_t> knownAddresses(const Config& config, const StateStore& store, const Log& log)
 {
-    std::map<std::string, uint8_t> known = store.all();
+    std::map<std::string, uint8_t> known = store.addresses();
     for (const auto& board : config.boards()) {
         if (board.address && !known.contains(board.boardId)) {
             known[board.boardId] = *board.address;
@@ -192,7 +196,7 @@ int main(int argc, char* argv[])
         for (const auto& warning : config.warnings()) {
             log.warning("{}", warning);
         }
-        auto store = AddressStore::load(stateFile);
+        auto store = StateStore::load(stateFile);
         const auto addresses = knownAddresses(config, store, log);
 
         auto pi2picoBus = std::make_shared<pi::interfaces::I2CDevI2C>("/dev/i2c-1");
@@ -205,6 +209,22 @@ int main(int argc, char* argv[])
         BusSink<Driver> sink(driver);
         BusCore core(std::move(config), sink);
 
+        // What the displays showed when we stopped: the boards get it as soon as they are there. A board that has never been
+        // given anything is left alone.
+        for (const auto& [name, status] : restoreDisplays(core, store)) {
+            log.warning("Not restoring display '{}' from the state file: {}.", name, toString(status));
+        }
+        auto saved = core.revision();
+        auto lastSave = std::chrono::steady_clock::now();
+        auto saveDisplays = [&] {
+            snapshotDisplays(core, store);
+            if (!store.save()) {
+                log.error("Cannot save the state to {}: what the displays show will not survive a restart.", stateFile);
+            }
+            saved = core.revision();
+            lastSave = std::chrono::steady_clock::now();
+        };
+
         // The bus controller hands out the addresses; we keep them, so a board has the same one after a restart.
         pi::protocols::I2CBusController controller(driver);
         controller.logger([&log](const std::string& line) { log.controller(line); });
@@ -213,7 +233,7 @@ int main(int argc, char* argv[])
             controller.addKnown(parseBoardId(boardId), address);
         }
         controller.onConfirmed([&store, &log](const pi::protocols::BoardId& id, uint8_t address) {
-            if (store.set(boardIdString(id), address)) {
+            if (store.setAddress(boardIdString(id), address)) {
                 log.info("Saved address 0x{:02x} of board {}.", address, boardIdString(id));
             } else {
                 log.error("Cannot save the address 0x{:02x} of board {}: it will not survive a restart.", address, boardIdString(id));
@@ -262,9 +282,16 @@ int main(int argc, char* argv[])
                 std::cout.flush();
             }
             core.flush();
+
+            if ((core.revision() != saved) && (std::chrono::steady_clock::now() - lastSave >= saveInterval)) {
+                saveDisplays();
+            }
         }
 
         log.info("Shutting down.");
+        if (core.revision() != saved) {
+            saveDisplays();
+        }
         driver.stopListening();
         driver.close();
     } catch (const std::exception& e) {

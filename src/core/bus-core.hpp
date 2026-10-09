@@ -124,6 +124,7 @@ private:
     std::vector<BoardEntry> boards_;
     std::deque<Event> events_;
     Clock::duration retryAfter_{ std::chrono::milliseconds(500) };
+    uint64_t revision_{ 0 };
 
     Entry* find(std::string_view name);
     BoardEntry& boardOf(const DisplayConfig& display);
@@ -154,6 +155,9 @@ public:
     void retryAfter(Clock::duration interval) { retryAfter_ = interval; }
 
     std::optional<DisplayState> state(std::string_view display) const;
+
+    /** Goes up each time `update()` changes what a display should show. Whoever saves the state can tell whether to. */
+    uint64_t revision() const { return revision_; }
     bool online(std::string_view board) const;
 
     /** Hand over the events since the last call. */

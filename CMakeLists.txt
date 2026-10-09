@@ -61,7 +61,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 add_library(i2cbus-core STATIC
     src/core/ini-file.cpp
     src/core/config.cpp
-    src/core/address-store.cpp
+    src/core/state-store.cpp
     src/core/commands.cpp
     src/core/bus-core.cpp)
 target_include_directories(i2cbus-core PUBLIC src/core)

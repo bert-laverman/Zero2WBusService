@@ -82,7 +82,10 @@ interface, `Sink`; the adapter that implements it with `RemoteMAX7219` and `I2CB
   not used give a warning.
 * `BusCore`: the state per display, **merging** (only the last value per display goes out at a `flush()`), **sending again**
   when a board comes online, and a queue of events (board online/offline).
-* `AddressStore`: the addresses of the boards, in a file that only the service writes (the configuration is never rewritten).
+* `StateStore`: what the service remembers, in a file that only the service writes (the configuration is never rewritten): the
+  address of every board, and what every display shows. Addresses are saved at once; the displays at most every 10 seconds, and
+  when the service stops (a power cut loses at most the last 10 seconds). After a restart the displays get their last value
+  back as soon as their boards are there. A brightness is only kept if it differs from the configuration's.
 * `runCommand`: the text commands (`set altitude 35000`, `show`, ...) of the command line tool, which the service also takes on
   its standard input until there is an HTTP layer.
 * What a display shows is a `variant` (`Blank`, `Number`), so segments and text can be added.
@@ -132,12 +135,15 @@ Two Picos (`PicoTestI2C`, a MAX7219 each, 0x61 and 0x62), commands typed on the 
 | Board A restarted (`picotool reboot -f`) | `gone` after 10 s, `appeared` and address saved at 11 to 13 s; the display showed its last value again without a command |
 | Board B in BOOTSEL, a value set while it was gone, then started | `gone` 10 s after BOOTSEL; the value set while offline showed after `appeared` |
 | Ctrl-C, then start again at once (twice) | `Shutting down.`; both boards found again within 2 seconds |
+| Values set, 10 s later `i2cbus-state.ini` | `[display:...]` sections with the content, and a brightness only where it differs from the configuration |
+| `set` and Ctrl-C within 10 s | The value is in the state file: stopping saves it |
+| Service stopped, board A restarted, service started | Display A showed its last value again (777), display B too (-250), without a command |
 
-Not tested yet: stopping with Ctrl-C or `kill` in the middle of a burst of messages, a failing bus (the retry delay), many
-updates at once on the real bus, and a service restart with displays that show something (see below).
+Not tested yet: stopping with Ctrl-C or `kill` in the middle of a burst of messages, a failing bus (the retry delay), and
+many updates at once on the real bus.
 
-The service forgets what the displays showed when it stops: only the addresses are saved. After a restart a board keeps showing
-what it showed, until somebody sets it.
+The values of the displays are saved and restored (see `StateStore`). A board that has never been given a value is left as it is, so after a restart it shows its own address: new boards are not
+blanked (decided on 9 October 2026).
 
 ## Building for the Zero
 

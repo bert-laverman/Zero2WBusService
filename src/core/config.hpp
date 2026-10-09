@@ -62,7 +62,7 @@ struct DisplayConfig {
  *
  * The file keeps the shape of the old `i2c-state.ini`. A display points to a device, a device to an interface, and an interface
  * to the board that controls it; here that chain is resolved, so the rest of the program only sees displays and boards.
- * The addresses of the boards are handed out by the bus controller and live in the state file (`AddressStore`). An `address`
+ * The addresses of the boards are handed out by the bus controller and live in the state file (`StateStore`). An `address`
  * in a board section, as the old `i2c-state.ini` has, is only used for a board that the state file does not know yet.
  *
  * A mistake is an error (`ConfigError`), not something we skip: a display that silently does not exist is hard to find.
